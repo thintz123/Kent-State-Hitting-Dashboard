@@ -1,166 +1,160 @@
-"""Compose the interactive pitching report and its supporting charts."""
+"""Compose the interactive hitting dashboard and the separate At-Bat breakdown sheet."""
 
-import numpy as np
+from html import escape
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
 
-from dashboard_config import PITCH_COLORS
-from dashboard_stats import pitch_summary, report_table
 from dashboard_charts import (
-    render_plate_location, render_pitch_movement, render_tilt_clock,
-    render_movement_clock, render_approach_angle_heatmaps, render_arm_slot,
-    report_chart_layout,
+    render_at_bat_cards,
+    render_chase_quadrants_chart,
+    render_contact_in_play_charts,
+    render_heart_take_whiff_chart,
+    render_plate_location,
+)
+from dashboard_stats import (
+    at_bat_pitch_log_table,
+    contact_in_play_table,
+    fmt,
+    hitting_overview_metrics,
+    report_table,
 )
 
 
-def compose_report(data: pd.DataFrame, ui=st) -> None:
-    """Render the pitching report."""
-    summary = pitch_summary(data)
+def _render_kpi_cards(data: pd.DataFrame, ui=st) -> None:
+    m = hitting_overview_metrics(data)
+    cards = [
+        (
+            "Heart Swing %",
+            fmt(m["heart_swing_pct"], "%"),
+            f"{m['heart_swings']} swings / {m['heart_pitches']} pitches in Heart "
+            f"({m['heart_takes']} takes, {fmt(m['heart_take_pct'], '%')})",
+            "#2563eb",
+        ),
+        (
+            "Heart Miss %",
+            fmt(m["heart_miss_pct"], "%"),
+            f"{m['heart_misses']} whiffs / {m['heart_swings']} Heart swings "
+            f"({fmt(m['heart_miss_per_pitch_pct'], '%')} of Heart pitches)",
+            "#dc2626",
+        ),
+        (
+            "Swing & Miss %",
+            fmt(m["swing_miss_pct"], "%"),
+            f"{m['total_whiffs']} whiffs / {m['total_swings']} total swings "
+            f"({fmt(m['swstr_pct'], '%')} SwStr)",
+            "#ea580c",
+        ),
+        (
+            "Chase %",
+            fmt(m["chase_pct"], "%"),
+            f"{m['chase_swings']} / {m['out_of_zone_pitches']} pitches out of zone",
+            "#9333ea",
+        ),
+        (
+            "Contact in Play (EV & LA)",
+            f"{m['in_play_count']} BIP",
+            f"Avg EV: {fmt(m['avg_exit_velo'], ' mph')} | "
+            f"Max EV: {fmt(m['max_exit_velo'], ' mph')} | "
+            f"Avg LA: {fmt(m['avg_launch_angle'], '°')}",
+            "#16a34a",
+        ),
+    ]
+    cards_html = "".join(
+        f'<div class="kpi-card" style="border-top: 4px solid {color};">'
+        f'<div class="kpi-label">{escape(label)}</div>'
+        f'<div class="kpi-value">{escape(val)}</div>'
+        f'<div class="kpi-sub">{escape(sub)}</div>'
+        f"</div>"
+        for label, val, sub, color in cards
+    )
+    ui.markdown(f'<div class="kpi-grid">{cards_html}</div>', unsafe_allow_html=True)
+
+
+def compose_main_report(data: pd.DataFrame, ui=st) -> None:
+    """Render Sheet 1: Hitters Report (Strike Zone, Heart Takes & Whiffs, Quadrant Chase, EV/LA & Spray Chart)."""
     table = report_table(data)
     ui.markdown(
-        "<div class='report-title'><h1>Trackman Pitching Report</h1>"
-        "<p>Kent State Baseball | Pitcher development report</p></div>",
+        "<div class='report-title'><h1>Kent State Hitters Report</h1>"
+        "<p>Strike Zone | Heart Takes &amp; Whiffs | Quadrant Chase | EV, Launch Angle &amp; Spray Chart</p></div>",
         unsafe_allow_html=True,
     )
+
+    _render_kpi_cards(data, ui=ui)
+
+    ui.subheader("Pitch Type Summary — Zone, Heart, Swing Decisions & Contact")
     ui.dataframe(
         table,
-        column_config={
-            "Spin Efficiency": st.column_config.NumberColumn(
-                "Spin Efficiency",
-                format="%.1f",
-            ),
-        },
         hide_index=True,
         use_container_width=True,
-        height=min(250, 38 + len(table) * 35),
+        height=min(280, 42 + len(table) * 35),
     )
 
-    location, movement = ui.columns(2)
-    with location:
+    location_col, heart_col = ui.columns(2)
+    with location_col:
         render_plate_location(data, ui=ui)
-    with movement:
-        render_pitch_movement(data, ui=ui)
+    with heart_col:
+        render_heart_take_whiff_chart(data, ui=ui)
+
+    ui.subheader("Chase in Each Quadrant")
+    render_chase_quadrants_chart(data, ui=ui)
+
+    ui.subheader("Every Contact in Play — EV Spray Chart (Green=Good, Yellow=Solid, Red=Bad), EV & Launch Angle")
+    render_contact_in_play_charts(data, ui=ui)
+
+    bip_table = contact_in_play_table(data)
+    if bip_table.empty:
+        ui.info("No balls in play were recorded for the selected filters.")
+    else:
+        ui.dataframe(
+            bip_table,
+            hide_index=True,
+            use_container_width=True,
+            height=min(360, 42 + len(bip_table) * 35),
+        )
+
+
+def compose_at_bat_sheet(data: pd.DataFrame, ui=st) -> None:
+    """Render Sheet 2: Every At-Bat Pitch Type (Velos), Count, and Location in Zone."""
     ui.markdown(
-        "<p class='scatter-caption'>Pitch Locations and Pitch Movement Scatterplots</p>",
+        "<div class='report-title sheet-break'><h1>At-Bat Pitch-by-Pitch Breakdown</h1>"
+        "<p>Every At-Bat Pitch Type, Velocity, Count &amp; Zone/Heart Location</p></div>",
         unsafe_allow_html=True,
     )
-    tilt_clock, movement_clock = ui.columns(2)
-    with tilt_clock:
-        render_tilt_clock(data, ui=ui)
-    with movement_clock:
-        render_movement_clock(data, ui=ui)
+    render_at_bat_cards(data, ui=ui)
 
-    ui.subheader("Velocity consistency")
-    fig = px.violin(
-        data,
-        x="RelSpeed",
-        y="MappedPitchType",
-        color="MappedPitchType",
-        orientation="h",
-        box=True,
-        points="all",
-        color_discrete_map=PITCH_COLORS,
-    )
-    fig.update_xaxes(title="Velocity (mph)")
-    fig.update_yaxes(title="")
-    ui.plotly_chart(report_chart_layout(fig, 300), use_container_width=True)
-
-    render_approach_angle_heatmaps(data, ui=ui)
-
-    usage, release, arm_slot = ui.columns(3)
-    with usage:
-        ui.subheader("Pitch usage %")
-        fig = px.pie(
-            summary,
-            values="Pitches",
-            names="MappedPitchType",
-            color="MappedPitchType",
-            color_discrete_map=PITCH_COLORS,
-            hole=0.02,
+    ui.subheader("Complete At-Bat Pitch Log")
+    log_table = at_bat_pitch_log_table(data)
+    if log_table.empty:
+        ui.info("No pitch rows available for the selected filters.")
+    else:
+        ui.dataframe(
+            log_table,
+            hide_index=True,
+            use_container_width=True,
+            height=min(420, 42 + len(log_table) * 35),
         )
-        fig.update_traces(textinfo="label+percent")
-        ui.plotly_chart(report_chart_layout(fig, 300), use_container_width=True)
-    with release:
-        ui.subheader("Pitch release points")
-        release_data = data.dropna(subset=["RelSide", "RelHeight"])
-        fig = go.Figure()
-        for pitch_type in release_data["MappedPitchType"].dropna().unique():
-            pitch_data = release_data[
-                release_data["MappedPitchType"].eq(pitch_type)
-            ]
-            fig.add_trace(
-                go.Scatter(
-                    x=pitch_data["RelSide"],
-                    y=pitch_data["RelHeight"],
-                    mode="markers",
-                    name=pitch_type,
-                    marker=dict(
-                        color=PITCH_COLORS.get(pitch_type, "black"),
-                        size=12,
-                        line=dict(color="black", width=1),
-                    ),
-                    customdata=pitch_data[["RelSpeed", "Extension"]].to_numpy(),
-                    hovertemplate=(
-                        "%{fullData.name}<br>"
-                        "Release side: %{x:.1f} ft<br>"
-                        "Release height: %{y:.1f} ft<br>"
-                        "Velocity: %{customdata[0]:.1f} mph"
-                        "<extra></extra>"
-                    ),
-                )
-            )
-        mean_x = release_data["RelSide"].mean()
-        mean_y = release_data["RelHeight"].mean()
-        if pd.notna(mean_x) and pd.notna(mean_y):
-            fig.add_trace(
-                go.Scatter(
-                    x=[mean_x],
-                    y=[mean_y],
-                    mode="markers",
-                    name=f"Side = {mean_x:.1f}<br>Height = {mean_y:.1f}",
-                    marker=dict(
-                        color="black",
-                        symbol="diamond",
-                        size=16,
-                        line=dict(color="black", width=1),
-                    ),
-                    hovertemplate=(
-                        "Mean release point<br>"
-                        "Side: %{x:.1f} ft<br>"
-                        "Height: %{y:.1f} ft"
-                        "<extra></extra>"
-                    ),
-                )
-            )
-            fig.add_hline(y=mean_y, line_color="black", line_width=1)
-            fig.add_vline(x=mean_x, line_color="black", line_width=1)
-        fig.update_xaxes(title="Release side (ft)")
-        fig.update_yaxes(title="Release height (ft)")
-        fig.update_layout(
-            showlegend=True,
-            legend=dict(orientation="h", y=-0.2),
-        )
-        ui.plotly_chart(report_chart_layout(fig, 300), use_container_width=True)
-    with arm_slot:
-        render_arm_slot(data, ui=ui)
-
-    ui.caption(
-        "Actionable review: compare each pitch's shape and location with its results. "
-        "Prioritize pitches with distinct movement, repeatable release, and a location "
-        "that supports the intended plan. Dataset: TrackMan export provided by Kent State."
-    )
 
 
+def compose_report(data: pd.DataFrame, ui=st, sheet_mode: str = "both") -> None:
+    """Render the requested report sheet(s): 'main', 'at_bats', or 'both'."""
+    if sheet_mode in {"main", "both"}:
+        compose_main_report(data, ui=ui)
+    if sheet_mode in {"at_bats", "both"}:
+        compose_at_bat_sheet(data, ui=ui)
 
-def render_report(data: pd.DataFrame, source_name: str = "", batter_side: str = "Both") -> None:
+
+def render_report(
+    data: pd.DataFrame,
+    source_name: str = "",
+    batter_side: str = "Both",
+    sheet_mode: str = "both",
+) -> None:
     """Display the same browser document used by the PDF exporter."""
     import streamlit.components.v1 as components
     from report_html import build_report_html
 
     components.html(
-        build_report_html(data, source_name, batter_side),
-        height=1000,
+        build_report_html(data, source_name, batter_side, sheet_mode=sheet_mode),
+        height=1050,
         scrolling=True,
     )

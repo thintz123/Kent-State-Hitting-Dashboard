@@ -1,4 +1,4 @@
-"""Print the website's shared report document to PDF using Chromium."""
+"""Print the website's shared hitting report document to PDF using Chromium."""
 
 from contextlib import contextmanager
 from io import BytesIO
@@ -11,9 +11,9 @@ from zipfile import ZipFile, ZIP_DEFLATED
 from report_html import REPORT_WIDTH, build_report_html
 
 
-def pdf_filename(pitcher: str) -> str:
-    name = re.sub(r"[^A-Za-z0-9_-]+", "_", str(pitcher)).strip("_")[:90]
-    return f"{name or 'pitcher'}_report.pdf"
+def pdf_filename(hitter: str) -> str:
+    name = re.sub(r"[^A-Za-z0-9_-]+", "_", str(hitter)).strip("_")[:90]
+    return f"{name or 'hitter'}_report.pdf"
 
 
 @contextmanager
@@ -56,7 +56,6 @@ def print_report(browser, document):
     """Use a continuous page so browser columns and charts are never split."""
     page = browser.new_page(viewport={"width": REPORT_WIDTH, "height": 1000}, device_scale_factor=1)
     try:
-        # The document embeds Plotly and needs no network access or uploaded-file URLs.
         page.route("**/*", lambda route: route.abort())
         page.set_content(document, wait_until="load")
         page.wait_for_function("window.reportReady || window.reportError", timeout=60000)
@@ -74,22 +73,28 @@ def print_report(browser, document):
         page.close()
 
 
-def build_pitcher_pdf(data, source_name, batter_side="Both"):
-    if data.empty or data["Pitcher"].nunique() != 1:
-        raise ValueError("A PDF must contain pitches from exactly one pitcher.")
-    document = build_report_html(data, source_name, batter_side)
+def build_hitter_pdf(data, source_name, batter_side="Both", sheet_mode="both"):
+    id_col = "Hitter" if "Hitter" in data.columns else "Pitcher"
+    if data.empty or data[id_col].nunique() != 1:
+        raise ValueError("A PDF must contain pitches from exactly one hitter.")
+    document = build_report_html(data, source_name, batter_side, sheet_mode=sheet_mode)
     with report_browser() as browser:
         return print_report(browser, document)
 
 
-def build_report_zip(data, source_name, batter_side="Both"):
-    """Reuse one browser; isolate each pitcher and avoid filename collisions."""
+# Keep build_pitcher_pdf alias for backward compatibility
+build_pitcher_pdf = build_hitter_pdf
+
+
+def build_report_zip(data, source_name, batter_side="Both", sheet_mode="both"):
+    """Reuse one browser; isolate each hitter and avoid filename collisions."""
     if data.empty:
         raise ValueError("No pitches are available to export.")
+    id_col = "Hitter" if "Hitter" in data.columns else "Pitcher"
     output = BytesIO()
     with report_browser() as browser, ZipFile(output, "w", ZIP_DEFLATED) as archive:
-        for index, (_, group) in enumerate(data.groupby("Pitcher", sort=True), start=1):
-            filename = f"{index:03d}_{pdf_filename(group['Pitcher'].iloc[0])}"
-            document = build_report_html(group, source_name, batter_side)
+        for index, (_, group) in enumerate(data.groupby(id_col, sort=True), start=1):
+            filename = f"{index:03d}_{pdf_filename(group[id_col].iloc[0])}"
+            document = build_report_html(group, source_name, batter_side, sheet_mode=sheet_mode)
             archive.writestr(filename, print_report(browser, document))
     return output.getvalue()

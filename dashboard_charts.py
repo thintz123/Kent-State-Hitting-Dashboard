@@ -1,717 +1,1182 @@
-"""Plotly location, movement, approach-angle, and sequencing charts."""
+"""Plotly strike-zone, octagonal heart (take & whiff), quadrant chase, EV/LA, and spray charts."""
 
+from html import escape
 import numpy as np
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
 from dashboard_config import (
-    PITCH_COLORS, PITCH_HEATMAPS, STRIKE_ZONE_X_MIN, STRIKE_ZONE_X_MAX,
-    STRIKE_ZONE_Y_MIN, STRIKE_ZONE_Y_MAX,
+    DEFAULT_HITTER_HEIGHT_IN,
+    EV_QUALITY_COLORS,
+    GOOD_EV_MIN,
+    PITCH_COLORS,
+    SOLID_EV_MIN,
+    format_height_ft_in,
+    get_zone_and_heart_bounds,
+    heart_octagon_svg_path,
 )
-from dashboard_stats import tilt_to_minutes
+from dashboard_stats import (
+    build_at_bats,
+    chase_by_quadrant_table,
+    fmt,
+    hitting_overview_metrics,
+    pitch_summary,
+)
+
+LIGHT_MARKER_COLORS = {"#eab308", "yellow", "lime", "cyan", "#65a30d", "#facc15"}
+
+
+def _resolve_plot_height_in(data: pd.DataFrame) -> float:
+    if "HitterHeightIn" in data.columns and data["HitterHeightIn"].notna().any():
+        return float(data["HitterHeightIn"].dropna().mean())
+    return DEFAULT_HITTER_HEIGHT_IN
+
+
+def add_zone_and_heart_shapes(
+    fig: go.Figure,
+    height_in: float | None = None,
+    compact: bool = False,
+    show_heart_label: bool = False,
+    emphasize_heart: bool = False,
+) -> go.Figure:
+    """Draw the height-adjusted 3x3 strike zone, octagonal Heart zone, and home plate."""
+    bounds = get_zone_and_heart_bounds(height_in)
+    sz_x_min, sz_x_max = bounds["sz_x_min"], bounds["sz_x_max"]
+    sz_y_min, sz_y_max = bounds["sz_y_min"], bounds["sz_y_max"]
+
+    # Outer Strike Zone
+    fig.add_shape(
+        type="rect",
+        x0=sz_x_min,
+        x1=sz_x_max,
+        y0=sz_y_min,
+        y1=sz_y_max,
+        line=dict(color="#111827", width=2.8 if not compact else 2.2),
+        fillcolor="rgba(241, 245, 249, 0.50)",
+        layer="below",
+    )
+
+    # 3x3 Strike Zone Grid Lines
+    for x in [
+        sz_x_min + (sz_x_max - sz_x_min) / 3.0,
+        sz_x_min + 2.0 * (sz_x_max - sz_x_min) / 3.0,
+    ]:
+        fig.add_shape(
+            type="line",
+            x0=x,
+            x1=x,
+            y0=sz_y_min,
+            y1=sz_y_max,
+            line=dict(color="#475569", width=1.4 if not compact else 1.1),
+            layer="below",
+        )
+    for y in [
+        sz_y_min + (sz_y_max - sz_y_min) / 3.0,
+        sz_y_min + 2.0 * (sz_y_max - sz_y_min) / 3.0,
+    ]:
+        fig.add_shape(
+            type="line",
+            x0=sz_x_min,
+            x1=sz_x_max,
+            y0=y,
+            y1=y,
+            line=dict(color="#475569", width=1.4 if not compact else 1.1),
+            layer="below",
+        )
+
+    # Inner Octagonal (Chamfered-Corner) Heart Zone
+    fig.add_shape(
+        type="path",
+        path=heart_octagon_svg_path(bounds),
+        line=dict(
+            color="#b91c1c" if emphasize_heart else "#dc2626",
+            width=3.2 if emphasize_heart else (2.6 if not compact else 2.2),
+        ),
+        fillcolor="rgba(239, 68, 68, 0.22)" if emphasize_heart else "rgba(239, 68, 68, 0.15)",
+        layer="below",
+    )
+
+    if show_heart_label:
+        ht_label = format_height_ft_in(bounds["height_in"])
+        fig.add_annotation(
+            x=1.95,
+            y=4.32,
+            text=f"Zone Height: {ht_label}",
+            showarrow=False,
+            xanchor="right",
+            yanchor="top",
+            font=dict(size=10, color="#475569"),
+            bgcolor="rgba(248, 250, 252, 0.90)",
+            bordercolor="#cbd5e1",
+            borderwidth=1,
+            borderpad=3,
+        )
+
+    # Home Plate Pentagon
+    fig.add_shape(
+        type="path",
+        path="M -0.71,0.55 L 0,0.35 L 0.71,0.55 L 0.52,0.75 L -0.52,0.75 Z",
+        line=dict(color="#111827", width=2.5 if not compact else 2),
+        fillcolor="white",
+        layer="below",
+    )
+    return fig
 
 
 def render_plate_location(data: pd.DataFrame, ui=st) -> None:
-    plot_data = data.dropna(subset=["PlateLocSide", "PlateLocHeight"])
+    """Render Strike Zone of where every pitch was and what pitch type it was."""
+    plot_data = data.dropna(subset=["PlateLocSide", "PlateLocHeight"]).copy()
+    height_in = _resolve_plot_height_in(data)
     fig = go.Figure()
+    add_zone_and_heart_shapes(fig, height_in=height_in, show_heart_label=True)
+
     for pitch_type in plot_data["MappedPitchType"].dropna().unique():
         pitch_data = plot_data[plot_data["MappedPitchType"].eq(pitch_type)]
+        custom = np.column_stack(
+            [
+                pitch_data["PitchCall"].fillna("-"),
+                pitch_data["RelSpeed"].fillna(np.nan),
+                pitch_data["Count"].fillna("-"),
+                pitch_data["ZoneRegion"].fillna("-"),
+            ]
+        )
         fig.add_trace(
             go.Scatter(
                 x=pitch_data["PlateLocSide"],
                 y=pitch_data["PlateLocHeight"],
                 mode="markers",
                 marker=dict(
-                    color=PITCH_COLORS.get(pitch_type, "black"),
-                    size=9,
-                    line=dict(color="black", width=1),
+                    color=PITCH_COLORS.get(pitch_type, "#334155"),
+                    size=11,
+                    line=dict(color="#0f172a", width=1.2),
                 ),
                 name=pitch_type,
-                customdata=pitch_data[["PitchCall", "RelSpeed"]].to_numpy(),
+                customdata=custom,
                 hovertemplate=(
-                    "%{fullData.name}<br>"
+                    "<b>%{fullData.name}</b><br>"
+                    "Count: %{customdata[2]}<br>"
+                    "Velo: %{customdata[1]:.1f} mph<br>"
+                    "Zone: %{customdata[3]}<br>"
                     "Call: %{customdata[0]}<br>"
-                    "Velocity: %{customdata[1]:.1f} mph"
+                    "Loc: (%{x:.2f}, %{y:.2f}) ft"
                     "<extra></extra>"
                 ),
             )
         )
-    fig.add_shape(
-        type="rect",
-        x0=STRIKE_ZONE_X_MIN,
-        x1=STRIKE_ZONE_X_MAX,
-        y0=STRIKE_ZONE_Y_MIN,
-        y1=STRIKE_ZONE_Y_MAX,
-        line=dict(color="#111", width=3),
-        fillcolor="#d9d9d9",
-        opacity=0.55,
-        layer="below",
-    )
-    for x in [-0.27, 0.27]:
-        fig.add_shape(
-            type="line",
-            x0=x,
-            x1=x,
-            y0=STRIKE_ZONE_Y_MIN,
-            y1=STRIKE_ZONE_Y_MAX,
-            line=dict(color="#888", width=1, dash="dash"),
-        )
-    for y in [
-        STRIKE_ZONE_Y_MIN + (STRIKE_ZONE_Y_MAX - STRIKE_ZONE_Y_MIN) / 3,
-        STRIKE_ZONE_Y_MIN + 2 * (STRIKE_ZONE_Y_MAX - STRIKE_ZONE_Y_MIN) / 3,
-    ]:
-        fig.add_shape(
-            type="line",
-            x0=STRIKE_ZONE_X_MIN,
-            x1=STRIKE_ZONE_X_MAX,
-            y0=y,
-            y1=y,
-            line=dict(color="#888", width=1, dash="dash"),
-        )
-    fig.add_shape(
-        type="path",
-        path="M -0.55,0.55 L 0,0.38 L 0.55,0.55 L 0.42,0.72 L -0.42,0.72 Z",
-        line=dict(color="#111", width=3),
-        fillcolor="white",
-    )
+
     fig.update_layout(
-        height=520,
-        title=dict(text="Pitch Locations", x=0.5, xanchor="center"),
+        height=510,
+        title=dict(text="Strike Zone — Every Pitch Location & Pitch Type", x=0.5, xanchor="center"),
         legend_title_text="",
-        margin=dict(l=10, r=10, t=20, b=10),
+        legend=dict(orientation="h", x=0.5, xanchor="center", y=-0.20, font=dict(size=11)),
+        margin=dict(l=45, r=20, t=45, b=85),
+        paper_bgcolor="white",
         plot_bgcolor="white",
     )
     fig.update_xaxes(
-        title="Catcher's view: horizontal location (ft)",
+        title=dict(text="Horizontal location (ft, catcher's view)", standoff=10),
         range=[-2.2, 2.2],
         zeroline=False,
+        showgrid=True,
+        gridcolor="#f1f5f9",
+        constrain="domain",
     )
     fig.update_yaxes(
         title="Vertical location (ft)",
-        range=[0.3, 4.5],
+        range=[0.25, 4.5],
         zeroline=False,
+        showgrid=True,
+        gridcolor="#f1f5f9",
+        scaleanchor="x",
+        scaleratio=1,
+        constrain="domain",
     )
     ui.plotly_chart(fig, use_container_width=True)
 
 
-
-def render_pitch_movement(data: pd.DataFrame, ui=st) -> None:
-    plot_data = data.dropna(subset=["HorzBreak", "InducedVertBreak"])
+def render_heart_take_whiff_chart(data: pd.DataFrame, ui=st) -> None:
+    """Render separate chart for Heart of the Strike Zone: Takes & Whiffs."""
+    plot_data = data.dropna(subset=["PlateLocSide", "PlateLocHeight"]).copy()
+    height_in = _resolve_plot_height_in(data)
     fig = go.Figure()
-    for pitch_type in plot_data["MappedPitchType"].dropna().unique():
-        pitch_data = plot_data[plot_data["MappedPitchType"].eq(pitch_type)]
-        fig.add_trace(
-            go.Histogram2dContour(
-                x=pitch_data["HorzBreak"],
-                y=pitch_data["InducedVertBreak"],
-                colorscale=PITCH_HEATMAPS.get(pitch_type, "Greys"),
-                contours=dict(coloring="fill", showlines=False),
-                ncontours=10,
-                showscale=False,
-                opacity=0.35,
-                hoverinfo="skip",
-                name=f"{pitch_type} density",
-                showlegend=False,
+    add_zone_and_heart_shapes(fig, height_in=height_in, show_heart_label=False, emphasize_heart=True)
+
+    m = hitting_overview_metrics(data)
+    heart_data = plot_data[plot_data["IsHeart"]].copy()
+
+    if not heart_data.empty:
+        conditions = [
+            heart_data["IsHeartMiss"],
+            heart_data["IsHeartTake"],
+            heart_data["IsInPlay"],
+            heart_data["IsHeartSwing"] & ~heart_data["IsHeartMiss"] & ~heart_data["IsInPlay"],
+        ]
+        choices = [
+            "Heart Whiff (Miss)",
+            "Heart Take",
+            "Heart In Play",
+            "Heart Foul",
+        ]
+        heart_data["HeartOutcome"] = np.select(conditions, choices, default="Heart Take")
+
+        bucket_styles = [
+            ("Heart Whiff (Miss)", dict(color="#dc2626", symbol="x", size=14)),
+            ("Heart Take", dict(color="#2563eb", symbol="circle", size=12)),
+            ("Heart In Play", dict(color="#16a34a", symbol="star", size=13)),
+            ("Heart Foul", dict(color="#eab308", symbol="diamond", size=11)),
+        ]
+        for label, style in bucket_styles:
+            sub = heart_data[heart_data["HeartOutcome"].eq(label)]
+            if sub.empty:
+                continue
+            custom = np.column_stack(
+                [
+                    sub["MappedPitchType"].fillna("-"),
+                    sub["RelSpeed"].fillna(np.nan),
+                    sub["Count"].fillna("-"),
+                    sub["PitchCall"].fillna("-"),
+                ]
             )
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=pitch_data["HorzBreak"],
-                y=pitch_data["InducedVertBreak"],
-                mode="markers",
-                marker=dict(
-                    color=PITCH_COLORS.get(pitch_type, "black"),
-                    size=9,
-                    line=dict(color="black", width=1),
-                ),
-                name=pitch_type,
-                customdata=pitch_data[["RelSpeed", "SpinRate", "SpinAxis"]].to_numpy(),
-                hovertemplate=(
-                    "%{fullData.name}<br>"
-                    "Horizontal break: %{x:.1f} in<br>"
-                    "Vertical break: %{y:.1f} in<br>"
-                    "Velocity: %{customdata[0]:.1f} mph"
-                    "<extra></extra>"
-                ),
+            fig.add_trace(
+                go.Scatter(
+                    x=sub["PlateLocSide"],
+                    y=sub["PlateLocHeight"],
+                    mode="markers",
+                    name=label,
+                    marker=dict(
+                        color=style["color"],
+                        symbol=style["symbol"],
+                        size=style["size"],
+                        line=dict(color="#0f172a", width=1.3),
+                    ),
+                    customdata=custom,
+                    hovertemplate=(
+                        "<b>%{fullData.name}</b><br>"
+                        "Pitch: %{customdata[0]} (%{customdata[1]:.1f} mph)<br>"
+                        "Count: %{customdata[2]} | Call: %{customdata[3]}<br>"
+                        "Loc: (%{x:.2f}, %{y:.2f}) ft"
+                        "<extra></extra>"
+                    ),
+                )
             )
-        )
-    fig.add_hline(y=0, line_color="#222", line_width=2)
-    fig.add_vline(x=0, line_color="#222", line_width=2)
+
+    summary_banner = (
+        f"Heart Pitches: {m['heart_pitches']} | "
+        f"Takes: {m['heart_takes']} ({fmt(m['heart_take_pct'], '%')}) | "
+        f"Whiffs: {m['heart_misses']} ({fmt(m['heart_miss_pct'], '%')}) | "
+        f"Heart Swing: {fmt(m['heart_swing_pct'], '%')}"
+    )
+    fig.add_annotation(
+        xref="paper",
+        yref="paper",
+        x=0.5,
+        y=0.98,
+        text=f"<b>{summary_banner}</b>",
+        showarrow=False,
+        xanchor="center",
+        yanchor="top",
+        font=dict(size=10.5, color="#0f172a"),
+        bgcolor="rgba(254, 242, 242, 0.94)",
+        bordercolor="#dc2626",
+        borderwidth=1,
+        borderpad=4,
+    )
+
     fig.update_layout(
-        height=520,
-        title=dict(text="Pitch Movements", x=0.5, xanchor="center"),
-        margin=dict(l=60, r=10, t=20, b=45),
+        height=510,
+        title=dict(
+            text="Heart of the Strike Zone — Takes & Whiffs",
+            x=0.5,
+            xanchor="center",
+        ),
+        legend_title_text="",
+        legend=dict(orientation="h", x=0.5, xanchor="center", y=-0.20, font=dict(size=11)),
+        margin=dict(l=45, r=20, t=45, b=85),
         paper_bgcolor="white",
         plot_bgcolor="white",
-        legend=dict(orientation="h", y=-0.15),
     )
     fig.update_xaxes(
-        title="Horizontal Break (inches)",
-        range=[-25, 25],
-        dtick=5,
+        title=dict(text="Horizontal location (ft, catcher's view)", standoff=10),
+        range=[-2.2, 2.2],
+        zeroline=False,
         showgrid=True,
-        gridcolor="#d0d0d0",
+        gridcolor="#f1f5f9",
+        constrain="domain",
     )
     fig.update_yaxes(
-        title="Vertical Break (inches)",
-        range=[-30, 30],
-        dtick=5,
+        title="Vertical location (ft)",
+        range=[0.25, 4.5],
+        zeroline=False,
         showgrid=True,
-        gridcolor="#d0d0d0",
+        gridcolor="#f1f5f9",
+        scaleanchor="x",
+        scaleratio=1,
+        constrain="domain",
     )
     ui.plotly_chart(fig, use_container_width=True)
 
 
+def render_chase_quadrants_chart(data: pd.DataFrame, ui=st) -> None:
+    """Render Chase in each of the 4 quadrants around the Strike Zone (chart + table)."""
+    height_in = _resolve_plot_height_in(data)
+    bounds = get_zone_and_heart_bounds(height_in)
+    sz_y_min, sz_y_max = bounds["sz_y_min"], bounds["sz_y_max"]
+    sz_mid_y = (sz_y_min + sz_y_max) / 2.0
 
-def _build_clock_figure(plot_data: pd.DataFrame, hover_label: str) -> go.Figure:
-    """Build a 30-minute sector polar bar clock from pitch directions in degrees."""
-    plot_data = plot_data.copy()
-    plot_data["Sector"] = (
-        np.floor((plot_data["Direction"] + 7.5) / 15).astype(int) % 24
-    )
-    counts = plot_data.groupby(["MappedPitchType", "Sector"]).size()
+    quad_table = chase_by_quadrant_table(data)
+    quad_map = {
+        row["Quadrant"]: row for _, row in quad_table.iterrows()
+    }
+
     fig = go.Figure()
-    for pitch_type in plot_data["MappedPitchType"].dropna().unique():
-        pitch_counts = counts.loc[pitch_type]
-        sectors = pitch_counts.index.to_numpy()
-        clock_labels = [
-            f"{(int(sector) // 2) or 12}:{30 * (int(sector) % 2):02d}"
-            for sector in sectors
+    fig.add_hline(y=sz_mid_y, line=dict(color="#64748b", width=1.8, dash="dash"))
+    fig.add_vline(x=0.0, line=dict(color="#64748b", width=1.8, dash="dash"))
+
+    add_zone_and_heart_shapes(fig, height_in=height_in, show_heart_label=False)
+
+    ooz = data[data["IsOutOfZone"]].dropna(subset=["PlateLocSide", "PlateLocHeight"]).copy()
+    if not ooz.empty:
+        ooz["ChaseOutcome"] = np.select(
+            [
+                ooz["IsSwing"] & ooz["IsWhiff"],
+                ooz["IsSwing"] & ~ooz["IsWhiff"],
+            ],
+            [
+                "Chase — Whiff",
+                "Chase — Foul / In Play",
+            ],
+            default="Out-of-Zone Take (Ball)",
+        )
+        styles = [
+            ("Chase — Whiff", dict(color="#dc2626", symbol="x", size=12)),
+            ("Chase — Foul / In Play", dict(color="#ea580c", symbol="diamond", size=11)),
+            ("Out-of-Zone Take (Ball)", dict(color="#94a3b8", symbol="circle-open", size=9)),
         ]
-        fig.add_trace(go.Barpolar(
-            theta=sectors * 15,
-            r=pitch_counts.to_numpy(),
-            width=15,
-            name=pitch_type,
-            marker=dict(
-                color=PITCH_COLORS.get(pitch_type, "gray"),
-                line=dict(color="#333", width=1),
-            ),
-            customdata=clock_labels,
-            hovertemplate=(
-                f"%{{fullData.name}}<br>{hover_label}: %{{customdata}}"
-                "<br>Pitches: %{r}<extra></extra>"
-            ),
-        ))
+        for label, style in styles:
+            sub = ooz[ooz["ChaseOutcome"].eq(label)]
+            if sub.empty:
+                continue
+            custom = np.column_stack(
+                [
+                    sub["MappedPitchType"].fillna("-"),
+                    sub["RelSpeed"].fillna(np.nan),
+                    sub["Count"].fillna("-"),
+                    sub["Quadrant"].fillna("-"),
+                ]
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=sub["PlateLocSide"],
+                    y=sub["PlateLocHeight"],
+                    mode="markers",
+                    name=label,
+                    marker=dict(
+                        color=style["color"],
+                        symbol=style["symbol"],
+                        size=style["size"],
+                        line=dict(color="#0f172a", width=1.2),
+                    ),
+                    customdata=custom,
+                    hovertemplate=(
+                        "<b>%{fullData.name}</b><br>"
+                        "Quadrant: %{customdata[3]}<br>"
+                        "Pitch: %{customdata[0]} (%{customdata[1]:.1f} mph)<br>"
+                        "Count: %{customdata[2]}<br>"
+                        "Loc: (%{x:.2f}, %{y:.2f}) ft"
+                        "<extra></extra>"
+                    ),
+                )
+            )
+
+    quad_positions = [
+        ("Up-Left", -1.45, 4.08),
+        ("Up-Right", 1.45, 4.08),
+        ("Down-Left", -1.45, 1.02),
+        ("Down-Right", 1.45, 1.02),
+    ]
+    for q_name, qx, qy in quad_positions:
+        row = quad_map.get(q_name, {})
+        pitches = int(row.get("Out-of-Zone Pitches", 0))
+        chases = int(row.get("Chases", 0))
+        chase_pct = row.get("Chase %", np.nan)
+        pct_str = f"{chase_pct:.1f}%" if pd.notna(chase_pct) else "-"
+        fig.add_annotation(
+            x=qx,
+            y=qy,
+            text=f"<b>{q_name}</b><br>Chase: <b>{pct_str}</b><br>({chases}/{pitches} pitches)",
+            showarrow=False,
+            font=dict(size=10.5, color="#1e293b"),
+            bgcolor="rgba(248, 250, 252, 0.92)",
+            bordercolor="#94a3b8",
+            borderwidth=1,
+            borderpad=4,
+        )
+
     fig.update_layout(
-        height=320,
-        barmode="stack",
+        height=490,
+        title=dict(text="Chase % in Each Quadrant (Out-of-Zone Pitches)", x=0.5, xanchor="center"),
+        legend_title_text="",
+        legend=dict(orientation="h", x=0.5, xanchor="center", y=-0.20, font=dict(size=11)),
+        margin=dict(l=45, r=20, t=45, b=85),
         paper_bgcolor="white",
-        margin=dict(l=40, r=40, t=35, b=40),
-        legend=dict(orientation="h", x=0.5, xanchor="center", y=-0.15),
-        polar=dict(
-            hole=0.25,
-            bgcolor="white",
-            angularaxis=dict(
-                rotation=90,
-                direction="clockwise",
-                tickmode="array",
-                tickvals=list(range(0, 360, 30)),
-                ticktext=["12"] + [str(hour) for hour in range(1, 12)],
-            ),
-            radialaxis=dict(
-                title="Pitch count", rangemode="tozero", nticks=4,
-                tickfont=dict(size=9),
-            ),
+        plot_bgcolor="white",
+    )
+    fig.update_xaxes(
+        title=dict(text="Horizontal location (ft, catcher's view)", standoff=10),
+        range=[-2.25, 2.25],
+        zeroline=False,
+        showgrid=True,
+        gridcolor="#f1f5f9",
+        constrain="domain",
+    )
+    fig.update_yaxes(
+        title="Vertical location (ft)",
+        range=[0.25, 4.55],
+        zeroline=False,
+        showgrid=True,
+        gridcolor="#f1f5f9",
+        scaleanchor="x",
+        scaleratio=1,
+        constrain="domain",
+    )
+
+    chart_col, table_col = ui.columns(2)
+    with chart_col:
+        ui.plotly_chart(fig, use_container_width=True)
+    with table_col:
+        ui.subheader("Chase Breakdown by Quadrant")
+        ui.dataframe(quad_table, hide_index=True, use_container_width=True)
+        render_discipline_by_pitch_chart(data, ui=ui)
+
+
+def render_discipline_by_pitch_chart(data: pd.DataFrame, ui=st) -> None:
+    """Render grouped bar chart of Heart Swing %, Heart Miss %, Swing & Miss %, and Chase % by pitch type."""
+    summary = pitch_summary(data)
+    if summary.empty:
+        return
+
+    metrics = [
+        ("Heart Swing %", "#2563eb"),
+        ("Heart Miss %", "#dc2626"),
+        ("Swing & Miss %", "#ea580c"),
+        ("Chase %", "#9333ea"),
+    ]
+    fig = go.Figure()
+    for col, color in metrics:
+        vals = summary[col].fillna(0.0)
+        labels = [f"{v:.0f}%" if pd.notna(raw) else "" for v, raw in zip(vals, summary[col])]
+        fig.add_trace(
+            go.Bar(
+                x=summary["MappedPitchType"],
+                y=vals,
+                name=col,
+                marker_color=color,
+                text=labels,
+                textposition="outside",
+                textfont=dict(size=9),
+                hovertemplate="%{x}<br>%{fullData.name}: %{y:.1f}%<extra></extra>",
+            )
+        )
+
+    fig.update_layout(
+        height=290,
+        barmode="group",
+        title=dict(
+            text="Plate Discipline & Heart Zone Rates by Pitch Type",
+            x=0.5,
+            xanchor="center",
+            y=0.97,
         ),
+        yaxis=dict(title="Rate (%)", range=[0, 120], showgrid=True, gridcolor="#e2e8f0"),
+        xaxis=dict(title="", tickangle=-20, tickfont=dict(size=10)),
+        legend=dict(orientation="h", x=0.5, xanchor="center", y=1.02, yanchor="bottom", font=dict(size=10)),
+        margin=dict(l=45, r=15, t=72, b=55),
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+    )
+    ui.plotly_chart(fig, use_container_width=True)
+
+
+def _outfield_wall_radius(angles_deg: np.ndarray) -> np.ndarray:
+    """Smoothly interpolate the outfield wall distance (ft) through the 5 stadium dimensions:
+    320 LF (-45°), 385 LC (-22.5°), 415 CF (0°), 355 RC (+22.5°), 320 RF (+45°).
+    Uses monotonic Hermite cubic splines so the wall stays convex without polynomial overshoot.
+    """
+    ctrl_x = np.array([-45.0, -22.5, 0.0, 22.5, 45.0])
+    ctrl_y = np.array([320.0, 385.0, 415.0, 355.0, 320.0])
+    # Slopes at the 5 control points (zero slope at dead center 0°)
+    slopes = np.array([3.2, 2.1, 0.0, -2.1, -1.4])
+
+    result = np.empty_like(angles_deg, dtype=float)
+    for idx, a in enumerate(angles_deg):
+        a_clamped = float(np.clip(a, -45.0, 45.0))
+        seg = int(np.clip(np.searchsorted(ctrl_x, a_clamped) - 1, 0, 3))
+        x0, x1 = ctrl_x[seg], ctrl_x[seg + 1]
+        y0, y1 = ctrl_y[seg], ctrl_y[seg + 1]
+        m0, m1 = slopes[seg], slopes[seg + 1]
+        h = x1 - x0
+        t = (a_clamped - x0) / h
+        h00 = 2 * t**3 - 3 * t**2 + 1
+        h10 = t**3 - 2 * t**2 + t
+        h01 = -2 * t**3 + 3 * t**2
+        h11 = t**3 - t**2
+        result[idx] = h00 * y0 + h10 * h * m0 + h01 * y1 + h11 * h * m1
+    return result
+
+
+def _smooth_corner(
+    p_start: tuple[float, float],
+    p_corner: tuple[float, float],
+    p_end: tuple[float, float],
+    steps: int = 12,
+) -> list[tuple[float, float]]:
+    """Quadratic Bezier fillet between p_start -> p_corner -> p_end."""
+    t_vals = np.linspace(0.0, 1.0, steps)
+    return [
+        (
+            float((1 - t) ** 2 * p_start[0] + 2 * (1 - t) * t * p_corner[0] + t ** 2 * p_end[0]),
+            float((1 - t) ** 2 * p_start[1] + 2 * (1 - t) * t * p_corner[1] + t ** 2 * p_end[1]),
+        )
+        for t in t_vals
+    ]
+
+
+def _build_stadium_shapes() -> list[dict[str, object]]:
+    """Build SVG paths for the baseball field with 320 LF, 385 LC, 415 CF, 355 RC, 320 RF."""
+    def _stadium_closed_path(offset: float = 0.0) -> str:
+        pts: list[tuple[float, float]] = []
+        d_foul = 22.0 + offset
+        shift = d_foul * np.sqrt(2.0)
+
+        # Outfield wall profile from -41° through LC (-22.5°), CF (0°), RC (+22.5°) to +41°
+        wall_angles = np.linspace(-41.0, 41.0, 83)
+        wall_radii = _outfield_wall_radius(wall_angles) + offset
+        wall_pts = [
+            (float(r_out * np.sin(np.radians(a))), float(r_out * np.cos(np.radians(a))))
+            for a, r_out in zip(wall_angles, wall_radii)
+        ]
+
+        # Left foul-territory line: y = -x - shift, meeting the LF corner smoothly
+        lf_line_top = (-205.0 - 0.7 * offset, 205.0 + 0.7 * offset - shift)
+        lf_corner_ctrl = (-236.0 - 0.85 * offset, 224.0 + 0.65 * offset)
+        pts.extend(_smooth_corner(lf_line_top, lf_corner_ctrl, wall_pts[0], steps=14))
+
+        # Outfield wall curve
+        pts.extend(wall_pts[1:-1])
+
+        # Right foul-territory line: y = x - shift, meeting the RF corner smoothly
+        rf_line_top = (205.0 + 0.7 * offset, 205.0 + 0.7 * offset - shift)
+        rf_corner_ctrl = (236.0 + 0.85 * offset, 224.0 + 0.65 * offset)
+        pts.extend(_smooth_corner(wall_pts[-1], rf_corner_ctrl, rf_line_top, steps=14))
+
+        # Rounded backstop behind home plate
+        for a in np.linspace(-45.0, -135.0, 25):
+            rad = np.radians(a)
+            pts.append((float(d_foul * np.cos(rad)), float(-6.0 + d_foul * np.sin(rad))))
+
+        first = f"M {pts[0][0]:.2f},{pts[0][1]:.2f}"
+        rest = " ".join(f"L {x:.2f},{y:.2f}" for x, y in pts[1:])
+        return f"{first} {rest} Z"
+
+    outer_wall_path = _stadium_closed_path(offset=16.0)
+    turf_path = _stadium_closed_path(offset=0.0)
+
+    mound_y = 60.5
+    r_infield = 95.0
+    max_alpha = float(np.degrees(np.arctan2(89.20, 93.20 - mound_y)))
+    arc_angles = np.linspace(-max_alpha, max_alpha, 61)
+    dirt_pts = [(-3.8, 0.0), (-89.20, 93.20)]
+    for a in arc_angles:
+        rad = np.radians(a)
+        dirt_pts.append((r_infield * np.sin(rad), mound_y + r_infield * np.cos(rad)))
+    dirt_pts.extend([(89.20, 93.20), (3.8, 0.0)])
+    dirt_path = (
+        f"M {dirt_pts[0][0]:.2f},{dirt_pts[0][1]:.2f} "
+        + " ".join(f"L {x:.2f},{y:.2f}" for x, y in dirt_pts[1:])
+        + " Z"
+    )
+
+    inner_grass_path = "M 0,13.5 L 51.5,63.64 L 0,113.8 L -51.5,63.64 Z"
+    foul_x = 320.0 * np.sin(np.radians(45.0))
+    foul_y = 320.0 * np.cos(np.radians(45.0))
+
+    return [
+        dict(
+            type="path",
+            path=outer_wall_path,
+            fillcolor="white",
+            line=dict(color="#e2e8f0", width=1.8),
+            layer="below",
+        ),
+        dict(
+            type="path",
+            path=turf_path,
+            fillcolor="#a8dad7",
+            line=dict(color="#a8dad7", width=1),
+            layer="below",
+        ),
+        dict(
+            type="path",
+            path=dirt_path,
+            fillcolor="white",
+            line=dict(color="white", width=1),
+            layer="below",
+        ),
+        dict(
+            type="path",
+            path=inner_grass_path,
+            fillcolor="#a8dad7",
+            line=dict(color="white", width=1.5),
+            layer="below",
+        ),
+        dict(
+            type="circle",
+            x0=-9,
+            x1=9,
+            y0=51.5,
+            y1=69.5,
+            fillcolor="white",
+            line=dict(color="#dcdcdc", width=1),
+            layer="below",
+        ),
+        dict(
+            type="line",
+            x0=-2.5,
+            y0=60.5,
+            x1=2.5,
+            y1=60.5,
+            line=dict(color="#b8c2cc", width=2),
+            layer="below",
+        ),
+        dict(
+            type="circle",
+            x0=-13,
+            x1=13,
+            y0=-13,
+            y1=13,
+            fillcolor="white",
+            line=dict(color="#dcdcdc", width=1),
+            layer="below",
+        ),
+        dict(
+            type="line",
+            x0=-9.2,
+            y0=9.2,
+            x1=-foul_x,
+            y1=foul_y,
+            line=dict(color="#b8c2cc", width=1.6),
+            layer="below",
+        ),
+        dict(
+            type="line",
+            x0=9.2,
+            y0=9.2,
+            x1=foul_x,
+            y1=foul_y,
+            line=dict(color="#b8c2cc", width=1.6),
+            layer="below",
+        ),
+        dict(
+            type="path",
+            path="M 0,123.5 L 3.8,127.3 L 0,131.1 L -3.8,127.3 Z",
+            fillcolor="#b8c2cc",
+            line=dict(width=0),
+            layer="below",
+        ),
+        dict(
+            type="path",
+            path="M 55.5,63.6 L 59.0,67.1 L 62.5,63.6 L 59.0,60.1 Z",
+            fillcolor="#b8c2cc",
+            line=dict(width=0),
+            layer="below",
+        ),
+        dict(
+            type="path",
+            path="M -55.5,63.6 L -59.0,67.1 L -62.5,63.6 L -59.0,60.1 Z",
+            fillcolor="#b8c2cc",
+            line=dict(width=0),
+            layer="below",
+        ),
+    ]
+
+
+def build_spray_chart_figure(data: pd.DataFrame) -> go.Figure:
+    """Build a Spray Chart of all batted balls colored by Exit Velocity quality (Green=Good, Yellow=Solid, Red=Bad)."""
+    in_play = data[data["IsInPlay"]].dropna(subset=["SprayX", "SprayY"]).copy()
+    fig = go.Figure()
+
+    distance_annotations = [
+        dict(x=-262, y=218, text="<b>320</b>"),
+        dict(x=-164, y=382, text="<b>385</b>"),
+        dict(x=0, y=442, text="<b>415</b>"),
+        dict(x=154, y=354, text="<b>355</b>"),
+        dict(x=262, y=218, text="<b>320</b>"),
+    ]
+    annotations = [
+        dict(
+            x=item["x"],
+            y=item["y"],
+            text=item["text"],
+            showarrow=False,
+            font=dict(size=15, color="#a8dad7", family="Arial Narrow, Arial"),
+        )
+        for item in distance_annotations
+    ]
+
+    if not in_play.empty:
+        quality_order = [
+            ("Good (95+ mph)", EV_QUALITY_COLORS["Good (95+ mph)"], 13),
+            ("Solid (80–94.9 mph)", EV_QUALITY_COLORS["Solid (80–94.9 mph)"], 12),
+            ("Bad (<80 mph)", EV_QUALITY_COLORS["Bad (<80 mph)"], 11),
+        ]
+        for q_label, color, size in quality_order:
+            sub = in_play[in_play["EVQuality"].eq(q_label)]
+            if sub.empty:
+                continue
+            custom = np.column_stack(
+                [
+                    sub["ExitSpeed"].fillna(np.nan),
+                    sub["Angle"].fillna(np.nan),
+                    sub["Distance"].fillna(np.nan),
+                    sub["PlayResult"].replace("Undefined", "In Play").fillna("In Play"),
+                    sub["TaggedHitType"].replace("Undefined", "-").fillna("-"),
+                    sub["MappedPitchType"].fillna("-"),
+                    sub["RelSpeed"].fillna(np.nan),
+                ]
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=sub["SprayX"],
+                    y=sub["SprayY"],
+                    mode="markers",
+                    name=q_label,
+                    marker=dict(
+                        color=color,
+                        size=size,
+                        line=dict(color="#111827", width=1.5),
+                    ),
+                    customdata=custom,
+                    hovertemplate=(
+                        "<b>%{fullData.name}</b> — %{customdata[3]}<br>"
+                        "Exit Velo: %{customdata[0]:.1f} mph | LA: %{customdata[1]:.1f}°<br>"
+                        "Distance: %{customdata[2]:.0f} ft (%{customdata[4]})<br>"
+                        "Pitch: %{customdata[5]} (%{customdata[6]:.1f} mph)"
+                        "<extra></extra>"
+                    ),
+                )
+            )
+
+    fig.update_layout(
+        height=470,
+        title=dict(
+            text="Batted Ball Spray Chart (by EV)",
+            x=0.5,
+            xanchor="center",
+            font=dict(size=15),
+        ),
+        shapes=_build_stadium_shapes(),
+        annotations=annotations,
+        legend=dict(orientation="h", x=0.5, xanchor="center", y=-0.10, font=dict(size=10.5)),
+        margin=dict(l=15, r=15, t=45, b=60),
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+    )
+    fig.update_xaxes(
+        visible=False,
+        range=[-315, 315],
+        fixedrange=False,
+        constrain="domain",
+    )
+    fig.update_yaxes(
+        visible=False,
+        range=[-65, 475],
+        scaleanchor="x",
+        scaleratio=1,
+        fixedrange=False,
+        constrain="domain",
     )
     return fig
 
 
+def render_contact_in_play_charts(data: pd.DataFrame, ui=st) -> None:
+    """Render EV-colored Spray Chart, Exit Velocity vs. Launch Angle scatterplot, and In-Play Zone locations."""
+    in_play = data[data["IsInPlay"]].copy()
+    height_in = _resolve_plot_height_in(data)
+    spray_col, ev_la_col, zone_col = ui.columns(3)
 
-def build_tilt_clock(data: pd.DataFrame) -> go.Figure:
-    """Bin spin-based tilt into 30-minute clock sectors."""
-    direction = pd.Series(np.nan, index=data.index, dtype=float)
-    if "SpinAxis" in data:
-        spin_axis = pd.to_numeric(data["SpinAxis"], errors="coerce")
-        direction = (spin_axis + 180) % 360
-    if "Tilt" in data:
-        minutes = data["Tilt"].map(tilt_to_minutes)
-        tilt_direction = (minutes / (12 * 60)) * 360 % 360
-        direction = direction.where(direction.notna(), tilt_direction)
-    valid = np.isfinite(direction)
-    plot_data = data.loc[valid, ["MappedPitchType"]].copy()
-    plot_data["Direction"] = direction.loc[valid].to_numpy(dtype=float)
-    return _build_clock_figure(plot_data, "Tilt direction")
+    with spray_col:
+        ui.plotly_chart(build_spray_chart_figure(data), use_container_width=True)
 
-
-
-def render_tilt_clock(data: pd.DataFrame, ui=st) -> None:
-    ui.subheader("Tilt direction by pitch type")
-    fig = build_tilt_clock(data)
-    if not fig.data:
-        ui.info("No tilt or spin-axis measurements are available for these filters.")
-        return
-    ui.plotly_chart(fig, use_container_width=True)
-    ui.caption(
-        "Direction shows spin-based movement (tilt) from pitcher POV on a 12-hour "
-        "clock: 12 is pure backspin; 6 is pure topspin; 3 and 9 are sidespin. "
-        "Each sector spans 30 clock minutes; bar length shows pitch count. "
-        "Missing or invalid tilt measurements are excluded."
-    )
-
-
-
-def build_movement_clock(data: pd.DataFrame) -> go.Figure:
-    """Bin movement vectors into 30-minute clock sectors, using export signs."""
-    columns = ["HorzBreak", "InducedVertBreak"]
-    movement = data[columns].apply(pd.to_numeric, errors="coerce")
-    valid = np.isfinite(movement).all(axis=1) & movement.ne(0).any(axis=1)
-    plot_data = data.loc[valid, ["MappedPitchType"]].copy()
-    # Zero degrees is up (12); positive horizontal break points right (3).
-    plot_data["Direction"] = (
-        np.degrees(np.arctan2(
-            movement.loc[valid, "HorzBreak"],
-            movement.loc[valid, "InducedVertBreak"],
-        )) % 360
-    )
-    return _build_clock_figure(plot_data, "Movement direction")
-
-
-
-def render_movement_clock(data: pd.DataFrame, ui=st) -> None:
-    ui.subheader("Observed movement direction by pitch type")
-    fig = build_movement_clock(data)
-    if not fig.data:
-        ui.info("No nonzero movement measurements are available for these filters.")
-        return
-    ui.plotly_chart(fig, use_container_width=True)
-    ui.caption(
-        "Direction is calculated from horizontal break and induced vertical break "
-        "(IVB), using the same signs as the movement scatterplot: positive HB "
-        "points to 3; positive IVB points to 12. Each sector spans 30 clock minutes; "
-        "bar length shows pitch count, not movement distance. IVB excludes gravity. "
-        "This is movement direction, not measured spin direction. "
-        "Missing, nonfinite, and zero-length movement vectors are excluded."
-    )
-
-
-
-def render_approach_angle_heatmaps(data: pd.DataFrame, ui=st) -> None:
-    """Render 3x3 VAA and HAA grids using the strike-zone thirds."""
-    angle_data = data.dropna(
-        subset=["PlateLocSide", "PlateLocHeight", "VertApprAngle", "HorzApprAngle"]
-    ).copy()
-    if angle_data.empty:
-        ui.info("Approach-angle data is not available for the selected filters.")
-        return
-
-    horizontal_bins = [
-        STRIKE_ZONE_X_MIN,
-        STRIKE_ZONE_X_MIN + (STRIKE_ZONE_X_MAX - STRIKE_ZONE_X_MIN) / 3,
-        STRIKE_ZONE_X_MIN + 2 * (STRIKE_ZONE_X_MAX - STRIKE_ZONE_X_MIN) / 3,
-        STRIKE_ZONE_X_MAX,
-    ]
-    vertical_bins = [
-        STRIKE_ZONE_Y_MIN,
-        STRIKE_ZONE_Y_MIN + (STRIKE_ZONE_Y_MAX - STRIKE_ZONE_Y_MIN) / 3,
-        STRIKE_ZONE_Y_MIN + 2 * (STRIKE_ZONE_Y_MAX - STRIKE_ZONE_Y_MIN) / 3,
-        STRIKE_ZONE_Y_MAX,
-    ]
-
-    angle_data["HorizontalThird"] = pd.cut(
-        angle_data["PlateLocSide"],
-        bins=horizontal_bins,
-        labels=["Left 1/3", "Center 1/3", "Right 1/3"],
-        include_lowest=True,
-    )
-    angle_data["VerticalThird"] = pd.cut(
-        angle_data["PlateLocHeight"],
-        bins=vertical_bins,
-        labels=["Bottom 1/3", "Middle 1/3", "Top 1/3"],
-        include_lowest=True,
-    )
-
-    row_labels = ["Top 1/3", "Middle 1/3", "Bottom 1/3"]
-    column_labels = ["Left 1/3", "Center 1/3", "Right 1/3"]
-
-    def make_grid(column: str) -> pd.DataFrame:
-        grid = (
-            angle_data.pivot_table(
-                index="VerticalThird",
-                columns="HorizontalThird",
-                values=column,
-                aggfunc="mean",
-                observed=False,
-            )
-            .reindex(index=row_labels, columns=column_labels)
-            .astype(float)
+    with ev_la_col:
+        fig = go.Figure()
+        fig.add_shape(
+            type="rect",
+            x0=GOOD_EV_MIN,
+            x1=120,
+            y0=8,
+            y1=32,
+            fillcolor="rgba(22, 163, 74, 0.12)",
+            line=dict(color="rgba(22, 163, 74, 0.4)", width=1, dash="dot"),
+            layer="below",
         )
-        return grid
+        fig.add_hline(y=8, line_dash="dash", line_color="#16a34a", line_width=1)
+        fig.add_hline(y=32, line_dash="dash", line_color="#16a34a", line_width=1)
+        fig.add_vline(x=GOOD_EV_MIN, line_dash="dash", line_color="#16a34a", line_width=1.5)
+        fig.add_vline(x=SOLID_EV_MIN, line_dash="dot", line_color="#eab308", line_width=1.5)
 
-    def make_figure(grid: pd.DataFrame, title: str) -> go.Figure:
-        annotations = []
-        for row_index, row in enumerate(grid.index):
-            for column_index, column in enumerate(grid.columns):
-                value = grid.loc[row, column]
-                annotations.append(
-                    dict(
-                        x=column_index,
-                        y=row_index,
-                        text="" if pd.isna(value) else f"{value:.1f}°",
-                        showarrow=False,
-                        font=dict(size=14, color="#222"),
+        valid_ev_la = in_play.dropna(subset=["ExitSpeed", "Angle"]).copy()
+        show_ev_text = len(valid_ev_la) <= 6
+        if not valid_ev_la.empty:
+            for q_label, color in EV_QUALITY_COLORS.items():
+                sub = valid_ev_la[valid_ev_la["EVQuality"].eq(q_label)]
+                if sub.empty:
+                    continue
+                labels = [
+                    f"{ev:.1f} mph | {la:.1f}°"
+                    for ev, la in zip(sub["ExitSpeed"], sub["Angle"])
+                ]
+                custom = np.column_stack(
+                    [
+                        sub["PlayResult"].replace("Undefined", "In Play").fillna("In Play"),
+                        sub["MappedPitchType"].fillna("-"),
+                        sub["RelSpeed"].fillna(np.nan),
+                        sub["Count"].fillna("-"),
+                        sub["TaggedHitType"].replace("Undefined", "-").fillna("-"),
+                    ]
+                )
+                fig.add_trace(
+                    go.Scatter(
+                        x=sub["ExitSpeed"],
+                        y=sub["Angle"],
+                        mode="markers+text" if show_ev_text else "markers",
+                        name=q_label,
+                        text=labels if show_ev_text else None,
+                        textposition="top center",
+                        textfont=dict(size=9.5, color="#1e293b"),
+                        marker=dict(
+                            color=color,
+                            size=12,
+                            line=dict(color="#0f172a", width=1.3),
+                        ),
+                        customdata=custom,
+                        hovertemplate=(
+                            "<b>%{fullData.name}</b> — %{customdata[0]}<br>"
+                            "Exit Velo: %{x:.1f} mph | Launch Angle: %{y:.1f}°<br>"
+                            "Hit Type: %{customdata[4]}<br>"
+                            "Pitch: %{customdata[1]} (%{customdata[2]:.1f} mph) | Count: %{customdata[3]}"
+                            "<extra></extra>"
+                        ),
                     )
                 )
-        fig = go.Figure(
-            go.Heatmap(
-                z=grid.to_numpy(),
-                x=list(range(3)),
-                y=list(range(3)),
-                colorscale="RdYlGn",
-                zmid=0,
-                hoverongaps=False,
-                hovertemplate=(
-                    f"{title}<br>%{{text}}<extra></extra>"
-                ),
-                text=[
-                    ["" if pd.isna(value) else f"{value:.1f}°" for value in grid.iloc[row]]
-                    for row in range(3)
-                ],
-                colorbar=dict(title="Degrees"),
-            )
-        )
+
+        min_ev = float(valid_ev_la["ExitSpeed"].min()) - 5 if not valid_ev_la.empty else 55
+        max_ev = float(valid_ev_la["ExitSpeed"].max()) + 8 if not valid_ev_la.empty else 115
         fig.update_layout(
-            title=dict(text=title, x=0.5, xanchor="center"),
-            height=330,
-            margin=dict(l=85, r=20, t=45, b=65),
+            height=470,
+            title=dict(
+                text="Exit Velocities (EV) & Launch Angle (°)",
+                x=0.5,
+                xanchor="center",
+                font=dict(size=15),
+            ),
+            xaxis=dict(
+                title=dict(text="Exit Velocity (mph)", standoff=10),
+                range=[min(60, min_ev), max(112, max_ev)],
+                showgrid=True,
+                gridcolor="#e2e8f0",
+            ),
+            yaxis=dict(
+                title="Launch Angle (°)",
+                range=[-45, 75],
+                showgrid=True,
+                gridcolor="#e2e8f0",
+                zeroline=True,
+                zerolinecolor="#94a3b8",
+            ),
+            legend=dict(orientation="h", x=0.5, xanchor="center", y=-0.22, font=dict(size=10.5)),
+            margin=dict(l=45, r=20, t=45, b=85),
             paper_bgcolor="white",
             plot_bgcolor="white",
-            annotations=annotations,
         )
-        fig.update_xaxes(
-            tickmode="array",
-            tickvals=list(range(3)),
-            ticktext=column_labels,
-            title="Horizontal location",
-            constrain="domain",
-            range=[-0.5, 2.5],
-            showgrid=False,
+        ui.plotly_chart(fig, use_container_width=True)
+
+    with zone_col:
+        fig_zone = go.Figure()
+        add_zone_and_heart_shapes(fig_zone, height_in=height_in, show_heart_label=False)
+        loc_in_play = in_play.dropna(subset=["PlateLocSide", "PlateLocHeight"]).copy()
+        show_zone_text = len(loc_in_play) <= 5
+        if not loc_in_play.empty:
+            for q_label, color in EV_QUALITY_COLORS.items():
+                sub = loc_in_play[loc_in_play["EVQuality"].eq(q_label)]
+                if sub.empty:
+                    continue
+                labels = [
+                    f"{ev:.1f} mph / {la:.1f}°"
+                    if pd.notna(ev) and pd.notna(la)
+                    else (f"{ev:.1f} mph" if pd.notna(ev) else "In Play")
+                    for ev, la in zip(sub["ExitSpeed"], sub["Angle"])
+                ]
+                custom = np.column_stack(
+                    [
+                        sub["PlayResult"].replace("Undefined", "In Play").fillna("In Play"),
+                        sub["MappedPitchType"].fillna("-"),
+                        sub["RelSpeed"].fillna(np.nan),
+                        sub["Count"].fillna("-"),
+                        sub["ZoneRegion"].fillna("-"),
+                        sub["ExitSpeed"].fillna(np.nan),
+                        sub["Angle"].fillna(np.nan),
+                    ]
+                )
+                fig_zone.add_trace(
+                    go.Scatter(
+                        x=sub["PlateLocSide"],
+                        y=sub["PlateLocHeight"],
+                        mode="markers+text" if show_zone_text else "markers",
+                        name=q_label,
+                        text=labels if show_zone_text else None,
+                        textposition="top center",
+                        textfont=dict(size=9, color="#0f172a"),
+                        marker=dict(
+                            color=color,
+                            size=12,
+                            symbol="star",
+                            line=dict(color="#0f172a", width=1.2),
+                        ),
+                        customdata=custom,
+                        hovertemplate=(
+                            "<b>%{fullData.name}</b> — %{customdata[0]}<br>"
+                            "EV: %{customdata[5]:.1f} mph | LA: %{customdata[6]:.1f}°<br>"
+                            "Pitch: %{customdata[1]} (%{customdata[2]:.1f} mph)<br>"
+                            "Count: %{customdata[3]} | %{customdata[4]}"
+                            "<extra></extra>"
+                        ),
+                    )
+                )
+
+        fig_zone.update_layout(
+            height=470,
+            title=dict(
+                text="Contact in Play — Zone Location",
+                x=0.5,
+                xanchor="center",
+                font=dict(size=15),
+            ),
+            legend=dict(orientation="h", x=0.5, xanchor="center", y=-0.22, font=dict(size=10.5)),
+            margin=dict(l=45, r=20, t=45, b=85),
+            paper_bgcolor="white",
+            plot_bgcolor="white",
+        )
+        fig_zone.update_xaxes(
+            title=dict(text="Horizontal location (ft, catcher's view)", standoff=10),
+            range=[-2.2, 2.2],
             zeroline=False,
+            showgrid=True,
+            gridcolor="#f1f5f9",
+            constrain="domain",
         )
-        fig.update_yaxes(
-            tickmode="array",
-            tickvals=list(range(3)),
-            ticktext=row_labels,
-            range=[2.5, -0.5],
-            autorange=False,
-            title="Vertical location",
+        fig_zone.update_yaxes(
+            title="Vertical location (ft)",
+            range=[0.25, 4.5],
+            zeroline=False,
+            showgrid=True,
+            gridcolor="#f1f5f9",
             scaleanchor="x",
             scaleratio=1,
             constrain="domain",
-            showgrid=False,
-            zeroline=False,
         )
-        # Draw the box edges at half-integers, not through the cell centers.
-        # Explicit edges also keep cells with missing measurements visible in PDF.
-        for edge in [-0.5, 0.5, 1.5, 2.5]:
-            fig.add_shape(type="line", x0=edge, x1=edge, y0=-0.5, y1=2.5,
-                          line=dict(color="#888", width=1), xref="x", yref="y")
-            fig.add_shape(type="line", x0=-0.5, x1=2.5, y0=edge, y1=edge,
-                          line=dict(color="#888", width=1), xref="x", yref="y")
-        return fig
-
-    vaa, haa = ui.columns(2)
-    with vaa:
-        ui.plotly_chart(make_figure(make_grid("VertApprAngle"), "VAA"), use_container_width=True)
-    with haa:
-        ui.plotly_chart(make_figure(make_grid("HorzApprAngle"), "HAA"), use_container_width=True)
+        ui.plotly_chart(fig_zone, use_container_width=True)
 
 
+def _deoverlap_at_bat_positions(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    min_dist: float = 0.25,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Slightly separate numbered pitch markers within an At-Bat so numbers never overlap."""
+    adj_x = xs.astype(float).copy()
+    adj_y = ys.astype(float).copy()
+    n = len(adj_x)
+    if n <= 1:
+        return adj_x, adj_y
 
-def render_sequence_chart(data: pd.DataFrame, ui=st) -> None:
-    sequence = data.dropna(subset=["PreviousPitch"]).copy()
-    sequence = sequence[sequence["PreviousPitch"] != sequence["MappedPitchType"]]
-    if sequence.empty:
-        ui.info("There are not enough different-pitch transitions for a sequencing view.")
-        return
-    sequence["Result"] = sequence["PitchCall"].replace(
-        {
-            "StrikeSwinging": "Whiff",
-            "StrikeCalled": "Called strike",
-            "InPlay": "In play",
-            "FoulBallNotFieldable": "Foul",
-        }
-    )
-    transitions = (
-        sequence.groupby(["PreviousPitch", "MappedPitchType"])
-        .agg(
-            Pitches=("PitchNo", "count"),
-            Whiff=("IsWhiff", "mean"),
-            Strike=("IsStrike", "mean"),
-        )
-        .reset_index()
-    )
-    transitions["Label"] = transitions.apply(
-        lambda row: f"{row['Pitches']} pitches | {row['Whiff']:.0%} whiff", axis=1
-    )
-    fig = px.scatter(
-        transitions,
-        x="PreviousPitch",
-        y="MappedPitchType",
-        size="Pitches",
-        color="Whiff",
-        text="Label",
-        color_continuous_scale="RdYlGn",
-        labels={
-            "PreviousPitch": "Pitch before",
-            "MappedPitchType": "Next pitch",
-            "Whiff": "Whiff rate",
-        },
-        height=420,
-    )
-    fig.update_traces(textposition="top center")
-    fig.update_layout(margin=dict(l=10, r=10, t=20, b=10))
-    ui.plotly_chart(fig, use_container_width=True)
+    for _ in range(12):
+        moved = False
+        for i in range(n):
+            for j in range(i + 1, n):
+                dx = adj_x[j] - adj_x[i]
+                dy = adj_y[j] - adj_y[i]
+                dist = float(np.hypot(dx, dy))
+                if dist < min_dist:
+                    if dist < 1e-4:
+                        angle = (j - i) * (np.pi / 3.0)
+                        ux, uy = float(np.cos(angle)), float(np.sin(angle))
+                    else:
+                        ux, uy = dx / dist, dy / dist
+                    push = 0.52 * (min_dist - dist)
+                    adj_x[i] -= ux * push
+                    adj_y[i] -= uy * push
+                    adj_x[j] += ux * push
+                    adj_y[j] += uy * push
+                    moved = True
+        if not moved:
+            break
+    return adj_x, adj_y
 
 
+def build_at_bat_zone_figure(ab: dict[str, object]) -> go.Figure:
+    """Build a compact Zone with Octagonal Heart plot for a single At-Bat with numbered pitches."""
+    pitches: pd.DataFrame = ab["pitches"]
+    located = pitches.dropna(subset=["PlateLocSide", "PlateLocHeight"]).copy()
+    height_in = _resolve_plot_height_in(pitches)
 
-def _svg_path(points: list[tuple[float, float | str]], sign: float = 1.0) -> str:
-    """Build an SVG path string while mirroring x-coordinates by sign."""
-    tokens = []
-    for item in points:
-        cmd = item[0]
-        coords = item[1:]
-        scaled = [
-            f"{val * sign if idx % 2 == 0 else val:.3f}"
-            for idx, val in enumerate(coords)
-        ]
-        tokens.append(f"{cmd} {' '.join(scaled)}")
-    return " ".join(tokens) + " Z"
-
-
-
-def build_arm_slot_chart(data: pd.DataFrame) -> go.Figure:
-    """Render a pitcher silhouette and mound with arm-slot cones to mean release points."""
-    release_data = data.dropna(subset=["RelSide", "RelHeight"])
     fig = go.Figure()
-    if release_data.empty:
-        return fig
+    add_zone_and_heart_shapes(fig, height_in=height_in, compact=True, show_heart_label=False)
 
-    throws = (
-        release_data["PitcherThrows"].dropna().astype(str).str.upper().tolist()
-        if "PitcherThrows" in release_data
-        else []
-    )
-    if any(val.startswith("L") for val in throws) and not any(val.startswith("R") for val in throws):
-        sign = -1.0
-    elif any(val.startswith("R") for val in throws):
-        sign = 1.0
-    else:
-        sign = -1.0 if release_data["RelSide"].mean() < 0 else 1.0
-
-    # Silhouette body, shading, and belt in feet (RHP default; mirrored by sign for LHP)
-    body_path = _svg_path([
-        ("M", 0.20, 1.12),
-        ("L", 0.14, 1.82),
-        ("Q", 0.02, 2.48, -0.18, 3.08),
-        ("L", -0.28, 3.18),
-        ("Q", -0.60, 2.86, -0.74, 3.18),
-        ("Q", -0.84, 3.62, -0.64, 4.18),
-        ("Q", -0.50, 4.44, -0.34, 4.48),
-        ("Q", -0.56, 4.54, -0.66, 4.82),
-        ("Q", -0.74, 5.14, -0.44, 5.24),
-        ("Q", -0.16, 5.26, -0.10, 4.90),
-        ("Q", -0.06, 4.70, -0.08, 4.60),
-        ("Q", 0.22, 4.64, 0.46, 4.50),
-        ("Q", 0.64, 4.38, 0.60, 4.08),
-        ("Q", 0.68, 3.64, 0.78, 3.18),
-        ("Q", 0.90, 2.70, 0.88, 2.22),
-        ("Q", 0.94, 1.82, 0.90, 1.62),
-        ("Q", 0.74, 1.30, 0.52, 1.12),
-    ], sign)
-
-    shade_upper = _svg_path([
-        ("M", -0.28, 3.18),
-        ("Q", -0.60, 2.86, -0.74, 3.18),
-        ("Q", -0.84, 3.62, -0.64, 4.18),
-        ("Q", -0.46, 4.38, -0.16, 4.34),
-        ("Q", -0.06, 3.88, -0.24, 3.48),
-    ], sign)
-
-    shade_lower = _svg_path([
-        ("M", 0.20, 1.12),
-        ("L", 0.14, 1.82),
-        ("Q", 0.04, 2.38, -0.12, 2.95),
-        ("Q", 0.32, 2.90, 0.60, 2.68),
-        ("Q", 0.56, 2.08, 0.52, 1.12),
-    ], sign)
-
-    belt_path = _svg_path([
-        ("M", -0.18, 3.08),
-        ("Q", 0.30, 3.20, 0.78, 3.14),
-        ("L", 0.76, 3.26),
-        ("Q", 0.30, 3.32, -0.20, 3.20),
-    ], sign)
-
-    shapes = [
-        # Silhouette base & two-tone shading
-        dict(
-            type="path", path=body_path,
-            fillcolor="#d4e3e3", line=dict(color="#7a9090", width=1.8),
-            layer="below",
-        ),
-        dict(
-            type="path", path=shade_upper,
-            fillcolor="#bfd2d2", line=dict(width=0),
-            layer="below",
-        ),
-        dict(
-            type="path", path=shade_lower,
-            fillcolor="#bfd2d2", line=dict(width=0),
-            layer="below",
-        ),
-        dict(
-            type="path", path=belt_path,
-            fillcolor="#d4e3e3", line=dict(color="#8aa0a0", width=1.3),
-            layer="below",
-        ),
-        # Leg separation contour
-        dict(
-            type="path",
-            path=f"M {0.36 * sign:.3f} 2.48 L {0.38 * sign:.3f} 1.80 Q {0.50 * sign:.3f} 1.55 {0.42 * sign:.3f} 1.14",
-            line=dict(color="#7a9090", width=1.5),
-            layer="below",
-        ),
-    ]
-
-    sx, sy = 0.36 * sign, 4.42
-    pitch_Order = list(release_data["MappedPitchType"].dropna().unique())
-    pitch_points = []
-
-    for pitch_type in pitch_Order:
-        pitch_data = release_data[release_data["MappedPitchType"].eq(pitch_type)]
-        rx = float(pitch_data["RelSide"].mean())
-        ry = float(pitch_data["RelHeight"].mean())
-        dx, dy = rx - sx, ry - sy
-        dist = float(np.hypot(dx, dy))
-        if dist > 1e-3:
-            ux, uy = dx / dist, dy / dist
-            nx, ny = -uy, ux
-            w0, w1 = 0.11, 0.14
-            p1x, p1y = sx + nx * w0, sy + ny * w0
-            p2x, p2y = rx + nx * w1, ry + ny * w1
-            p3x, p3y = rx - nx * w1, ry - ny * w1
-            p4x, p4y = sx - nx * w0, sy - ny * w0
-            cone_path = (
-                f"M {p1x:.3f} {p1y:.3f} L {p2x:.3f} {p2y:.3f} "
-                f"L {p3x:.3f} {p3y:.3f} L {p4x:.3f} {p4y:.3f} Z"
-            )
-            shapes.append(dict(
-                type="path", path=cone_path,
-                fillcolor="rgba(205, 224, 224, 0.78)",
-                line=dict(color="#6b8282", width=1.8),
-                layer="below",
-            ))
-        slot_deg = float(np.degrees(np.arctan2(ry - sy, abs(rx - sx))))
-        pitch_points.append((pitch_type, rx, ry, slot_deg, len(pitch_data)))
-
-    # Shoulder pivot circle on top of cone bases
-    r_sh = 0.12
-    shapes.append(dict(
-        type="circle",
-        x0=sx - r_sh, x1=sx + r_sh, y0=sy - r_sh, y1=sy + r_sh,
-        fillcolor="#d4e3e3", line=dict(color="#6b8282", width=2),
-        layer="below",
-    ))
-
-    # Grass, mound, and pitching rubber at the bottom
-    shapes.extend([
-        dict(
-            type="rect", x0=-3.4, x1=3.4, y0=0.0, y1=0.38,
-            fillcolor="#507c48", line=dict(color="#3d6136", width=1),
-            layer="below",
-        ),
-        dict(
-            type="rect", x0=-1.15, x1=1.15, y0=0.0, y1=0.38,
-            fillcolor="#476f40", line=dict(width=0),
-            layer="below",
-        ),
-        dict(
-            type="rect", x0=-3.4, x1=3.4, y0=0.38, y1=0.55,
-            fillcolor="#75371d", line=dict(width=0),
-            layer="below",
-        ),
-        dict(
-            type="path",
-            path="M -3.4 0.55 L -3.4 0.92 Q 0 1.12 3.4 0.92 L 3.4 0.55 Z",
-            fillcolor="#8a4224", line=dict(width=0),
-            layer="below",
-        ),
-        dict(
-            type="path",
-            path="M -3.4 0.92 Q 0 1.12 3.4 0.92",
-            line=dict(color="#2b1d16", width=3),
-            layer="below",
-        ),
-        dict(
-            type="path",
-            path="M -0.60 0.99 L 0.60 0.99 L 0.56 1.12 L -0.56 1.12 Z",
-            fillcolor="#f5f5f5", line=dict(color="#666666", width=1.5),
-            layer="below",
-        ),
-    ])
-
-    for pitch_type, rx, ry, slot_deg, count in pitch_points:
-        fig.add_trace(
-            go.Scatter(
-                x=[rx],
-                y=[ry],
-                mode="markers",
-                name=pitch_type,
-                marker=dict(
-                    color=PITCH_COLORS.get(pitch_type, "gray"),
-                    size=15,
-                    line=dict(color="#2b2b2b", width=2),
-                ),
-                customdata=[[slot_deg, count]],
-                hovertemplate=(
-                    "%{fullData.name}<br>"
-                    "Avg release side: %{x:.2f} ft<br>"
-                    "Avg release height: %{y:.2f} ft<br>"
-                    "Arm slot: %{customdata[0]:.1f}°<br>"
-                    "Pitches: %{customdata[1]}"
-                    "<extra></extra>"
-                ),
-            )
+    if not located.empty:
+        adj_x, adj_y = _deoverlap_at_bat_positions(
+            located["PlateLocSide"].to_numpy(),
+            located["PlateLocHeight"].to_numpy(),
+            min_dist=0.38,
         )
+        located["PlotX"] = adj_x
+        located["PlotY"] = adj_y
 
-    max_ry = max((pt[2] for pt in pitch_points), default=6.2)
+        for pitch_type in located["MappedPitchType"].dropna().unique():
+            sub = located[located["MappedPitchType"].eq(pitch_type)]
+            bg_color = PITCH_COLORS.get(pitch_type, "#334155")
+            text_color = "#0f172a" if str(bg_color).lower() in LIGHT_MARKER_COLORS else "white"
+            custom = np.column_stack(
+                [
+                    sub["PitchInAB"].astype(int),
+                    sub["Count"].fillna("-"),
+                    sub["RelSpeed"].fillna(np.nan),
+                    sub["OutcomeLabel"].fillna("-"),
+                    sub["ZoneRegion"].fillna("-"),
+                    sub["PlateLocSide"].fillna(np.nan),
+                    sub["PlateLocHeight"].fillna(np.nan),
+                ]
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=sub["PlotX"],
+                    y=sub["PlotY"],
+                    mode="markers+text",
+                    name=pitch_type,
+                    text=sub["PitchInAB"].astype(int).astype(str),
+                    textposition="middle center",
+                    textfont=dict(color=text_color, size=10.5, family="Arial Black, Arial"),
+                    marker=dict(
+                        color=bg_color,
+                        size=21,
+                        line=dict(color="#0f172a", width=1.6),
+                    ),
+                    customdata=custom,
+                    hovertemplate=(
+                        "<b>Pitch #%{customdata[0]} — %{fullData.name}</b><br>"
+                        "Count: %{customdata[1]}<br>"
+                        "Velo: %{customdata[2]:.1f} mph<br>"
+                        "Zone: %{customdata[4]}<br>"
+                        "Coords: (%{customdata[5]:.2f}, %{customdata[6]:.2f}) ft<br>"
+                        "Result: %{customdata[3]}"
+                        "<extra></extra>"
+                    ),
+                )
+            )
+
     fig.update_layout(
-        height=300,
-        margin=dict(l=10, r=10, t=10, b=35),
+        height=355,
+        showlegend=True,
+        title=dict(
+            text="Pitch Sequence in Zone & Heart",
+            x=0.5,
+            xanchor="center",
+            y=0.97,
+            font=dict(size=13),
+        ),
+        legend=dict(
+            orientation="h",
+            x=0.5,
+            xanchor="center",
+            y=1.01,
+            yanchor="bottom",
+            font=dict(size=10.5),
+        ),
+        margin=dict(l=40, r=20, t=58, b=45),
         paper_bgcolor="white",
         plot_bgcolor="white",
-        shapes=shapes,
-        showlegend=True,
-        legend=dict(orientation="h", x=0.5, xanchor="center", y=-0.12),
     )
     fig.update_xaxes(
-        visible=False,
-        range=[-3.4, 3.4],
-        fixedrange=True,
+        title=dict(text="Horizontal (ft, catcher's view)", standoff=8, font=dict(size=11)),
+        range=[-2.15, 2.15],
+        zeroline=False,
+        showgrid=True,
+        gridcolor="#f1f5f9",
+        constrain="domain",
     )
     fig.update_yaxes(
-        visible=False,
-        range=[0.0, max(6.6, max_ry + 0.5)],
+        title=dict(text="Vertical (ft)", font=dict(size=11)),
+        range=[0.25, 4.4],
+        zeroline=False,
+        showgrid=True,
+        gridcolor="#f1f5f9",
         scaleanchor="x",
         scaleratio=1,
-        fixedrange=True,
+        constrain="domain",
     )
     return fig
 
 
+def format_single_ab_table(pitches: pd.DataFrame) -> pd.DataFrame:
+    """Format pitch sequence table for one At-Bat."""
+    rows = []
+    for _, row in pitches.iterrows():
+        ev = row.get("ExitSpeed")
+        la = row.get("Angle")
+        contact_str = (
+            f"{ev:.1f} mph / {la:.1f}°"
+            if pd.notna(ev) and pd.notna(la)
+            else (f"{ev:.1f} mph" if pd.notna(ev) else "-")
+        )
+        rows.append(
+            {
+                "Pitch #": int(row["PitchInAB"]),
+                "Count": str(row.get("Count", "-")),
+                "Pitch Type": str(row.get("MappedPitchType", "Other")),
+                "Velo (mph)": round(float(row["RelSpeed"]), 1)
+                if pd.notna(row.get("RelSpeed"))
+                else np.nan,
+                "Location": str(row.get("ZoneRegion", "Unlocated")),
+                "Call / Result": str(row.get("OutcomeLabel", "-")),
+                "Contact (EV / LA)": contact_str,
+            }
+        )
+    return pd.DataFrame(rows)
 
-def render_arm_slot(data: pd.DataFrame, ui=st) -> None:
-    ui.subheader("Release point & arm slot")
-    fig = build_arm_slot_chart(data)
-    if not fig.data:
-        ui.info("Release point measurements are not available for these filters.")
+
+def render_at_bat_cards(data: pd.DataFrame, ui=st) -> None:
+    """Render every At-Bat with its full-width header, Zone-with-Heart pitch map, and sequence table."""
+    at_bats = build_at_bats(data)
+    if not at_bats:
+        ui.info("No at-bats are available for the selected filters.")
         return
-    ui.plotly_chart(fig, use_container_width=True)
 
+    for ab in at_bats:
+        header_html = (
+            f'<div class="ab-card-header">'
+            f'<span><b>AB #{ab["ab_number"]}</b> &bull; {escape(str(ab["inning"]))}</span>'
+            f'<span>{escape(str(ab["hitter"]))} ({escape(str(ab["batter_side"]))}) '
+            f'vs. {escape(str(ab["pitcher"]))} ({escape(str(ab["pitcher_throws"]))})</span>'
+            f'<span class="ab-outcome">Outcome: <b>{escape(str(ab["result"]))}</b></span>'
+            f"</div>"
+        )
+        ui.markdown(header_html, unsafe_allow_html=True)
+        zone_col, table_col = ui.columns(2)
+        with zone_col:
+            ui.plotly_chart(build_at_bat_zone_figure(ab), use_container_width=True)
+        with table_col:
+            ab_table = format_single_ab_table(ab["pitches"])
+            ui.dataframe(ab_table, hide_index=True, use_container_width=True)
 
 
 def report_chart_layout(fig: go.Figure, height: int = 300) -> go.Figure:
@@ -724,4 +1189,3 @@ def report_chart_layout(fig: go.Figure, height: int = 300) -> go.Figure:
         showlegend=False,
     )
     return fig
-
